@@ -79,7 +79,23 @@ layers.{N}.
 
 **FFN 占总参数量的 78.2%**，attention 占 21.8%。这意味着推理的主要计算瓶颈在 FFN——而这也是三频解耦能大幅加速的根本原因。
 
-### 1.4 Self-Attention 与 Cross-Attention 的关系
+### 1.4 五种模态如何统一
+
+Cosmos 3 宣称统一了语言、图像、视频、音频、动作五种模态。从实际权重结构来看，"统一"发生在以下层面：
+
+**Token 序列层面**：所有模态编码为统一 latent space 中的 token，拼接成一个序列。AR tokens 包括 text tokens（通过 Qwen3-VL tokenizer 编码）和 vision tokens（通过 SigLIP2 vision encoder 编码）；DM tokens 包括 VAE latent video patches、audio tokens、以及 action tokens。
+
+**Self-Attention 层面**：所有模态的 token 在同一个 self-attention 中混在一起——Text ↔ Vision 互相 attend（AR 路径内），Video ↔ Audio ↔ Action 互相 attend（DM 路径内），DM 可读取 AR（通过全注意力 mask 和 add_* 交叉注意力）。
+
+**3D mRoPE 位置编码**：不同模态通过统一的位置编码方案在 latent space 中被区分。从 config 中 `unified_3d_mrope_temporal_modality_margin: 15000` 来看，不同模态被分配在 mRoPE 位置编码的不同区间，通过 margin 隔开。这样同一套 position encoding 编码了所有模态的时空结构。
+
+**FFN 路由**：模态不通过 5 套 FFN 区分，而是聚合成两条路径——AR 路径（mlp）处理 Text + Vision tokens，DM 路径（mlp_moe_gen）处理 Video + Audio + Action tokens。
+
+**模态专属 Embedding**：每种模态有其独特的输入/输出投影。特别是 Action 的投影最具特色——`action_proj_in/out` 第一维是 32，对应 Cosmos 3 支持的 32 种 embodiment（camera_pose, av, droid, bridge, fractal, ur, umi, dual_arm, agibot 等），每种具身形态有自己独立的 [4096, 64] 投影矩阵。不同具身形态的动作维度不同（DROID 单臂 8-D joint_pos、Libero 10-D rot6d、AV 9-D、egocentric 手部 57-D），但都投影到统一的 64 维 latent 空间后进入 Transformer。
+
+**一句话：五模态统一在 token 序列和 self-attention 层面，FFN 只区分"理解"和"生成"两种计算模式，模态的差异靠 embedding、mRoPE 位置区间、和 embodiment-specific 投影来表达。**
+
+### 1.5 Self-Attention 与 Cross-Attention 的关系
 
 这是理解 Cosmos 3 架构最核心的一个问题。Self-Attention 的 Q/K/V 来自"所有 token 拼接"，DM tokens 天然可以在全注意力 mask 下 attend AR tokens。那为什么还需要额外的 Cross-Attention？
 
@@ -89,7 +105,39 @@ layers.{N}.
 
 从机制上看，两者完全不同：Self-Attention 是"token 级混合"（Q/K/V 都来自同一个拼接序列），Cross-Attention 是"Encoder-Decoder 模式"（Q 仅来自 DM tokens，K/V 仅来自 AR tokens）。功能分工上：Self-Attention 负责全局上下文建模和时空一致性，Cross-Attention 负责条件跟随精度——"DM 拿着问题清单专访 AR 专家"。
 
-### 1.5 训练中的 AR↔DiT 相互受益关系
+### 1.6 Generator 的训练起点：从 VLM "长出"扩散能力
+
+这是理解 Cosmos 3 和三频拆分可行性的一个关键事实：**Cosmos 3 的 Generator 不是从一个现成的 DiT 模型训练来的，而是从一个 VLM（Qwen3-VL-8B）"长"出来的。**
+
+```
+起点: Qwen3-VL-8B (纯 AR VLM, 不含任何扩散能力)
+│
+│ 每层只有: self_attn Q/K/V/O (1套), mlp (1套), layernorms
+│
+├── Step 1: 复制出 Generator 专属参数
+│   mlp ──复制──→ mlp_moe_gen        (同样的 FFN 权重作为初始化)
+│   layernorm ──复制──→ layernorm_moe_gen
+│   
+├── Step 2: 添加扩散独有的新参数 (随机初始化)
+│   add_* 交叉注意力, time_embedder, proj_in/out, action/audio 投影
+│
+├── Step 3: Generator 预训练 (冻结 AR FFN, 训练 DM FFN + 新参数)
+│   VLM 的 self-attention Q/K/V 被直接复用
+│   → Generator 的 attention 能力完全继承自 VLM 的视觉-语言理解
+│
+└── Step 4: 后训练 SFT (解冻全部, 联合微调)
+```
+
+这意味着：
+1. **VLM 初始化不是"省数据"，而是"省表征学习"**。Generator 不需要数据来重新学会"什么是物体"、"语言和视觉怎么对应"——这些 VLM 已经会了。但扩散去噪本身、latent domain 的特征变换、交叉注意力的条件注入——这些 VLM 中完全不存在的能力——仍然需要海量数据从零学起。Cosmos 3 的预训练数据规模（~400M 视频 + ~1B 图像 + ~20T text tokens）和纯 DiT 模型（SD3、Flux、Sora 等）在同一个数量级。
+
+2. **mlp 和 mlp_moe_gen 结构完全相同的根本原因**：因为 mlp_moe_gen 本来就是从 mlp 复制过来的初始化。预训练期间两者从同一个起点分化——mlp 冻结保持语言能力，mlp_moe_gen 学习 latent 去噪。
+
+3. **拆分后 AR 能独立工作的信心来源**：因为它的 mlp 在 Cosmos 3 的预训练阶段是冻结的，只在后训练 SFT 阶段被微调。如果后训练的数据量不大（cosmos-framework 的 SFT cookbook 表明只需要几万条数据），AR 的推理能力不应该有显著退化。
+
+4. **这也解释了为什么三频拆分可行**：AR 和 DM 本来就是"同一个起点、分化训练"的产物——拆分只是在推理层面恢复了这个天然边界。
+
+### 1.7 训练中的 AR↔DiT 相互受益关系
 
 **AR → DiT（直接且巨大）**：
 - 语言理解：AR 训练教会的语义通过交叉注意力直接注入 DM token
@@ -103,7 +151,7 @@ layers.{N}.
 
 这种不对称是架构的刻意设计：**Generator 被 Reasoner 充分条件，但 Reasoner 不受 Generator 扰动。**
 
-### 1.6 关于消融证据的诚实评估
+### 1.8 关于消融证据的诚实评估
 
 Paper 公开版（arXiv:2606.02800）**没有**提供教科书式的对照消融表（仅 DiT vs 完整模型、去掉交叉注意力 vs 保留、随机初始化 vs VLM 初始化等）。NVIDIA 用基准横扫（同一 checkpoint 在 VANTAGE-Bench、PAI-Bench、RoboLab、Physics-IQ 同时登顶）作为"存在性证明"。训练流程设计（`freeze_und: false` 默认配置、从 VLM 初始化的决策、交叉注意力 42M/层的参数预算）和 DuoNeural 社区意外消融（修改 AR 通路晚期层权重直接导致生成内容质量下降）提供了间接但有力的证据。
 
@@ -946,7 +994,30 @@ Day 30: 接近自主
 
 6. **安全性**：AR 给出的修正指令如果本身有误（hallucination），如何通过多频架构的冗余性（Video 物理门控 + Action 执行边界）来兜底？这要求 Video 和 Action 层在面对 AR 错误指令时能够"反驳"——但这又需要额外的安全机制。
 
+7. **从"拆分"到"原生训练"的路径**：当前方案是从已训练的 Cosmos 3 拆分出三频。更长远的问题是：能否从一开始就按三频架构训练？即联合训练时就在损失函数中显式建模三层频率各自的优化目标，而不是让 AR 和 DM 共享同一套 Q/K/V 的梯度。如果能从零训三频模型，会出现新的协同收益还是新的冲突？
+
+8. **三频架构能否反向验证 MoT 的核心假设**：如 §1.6 所述，NVIDIA 没有公开干净的消融实验。如果将 Cosmos 3 拆分后，AR 独立推理能力与原始 Cosmos 3 完全一致（说明 DiT 训练未"污染"VLM），且 Action DiT 在挂上 AR 条件后明显优于不挂条件的基线（说明 AR 知识对 DiT 有真实的正迁移），这本身就构成了对 MoT 架构的独立验证——而且比 paper 本身任何已公开的实验都更干净。
+
 ---
+
+## 12. 结语：为什么这个方向值得投入
+
+回顾从 Cosmos 3 架构分析到三频设计的完整推理链，几个核心判断越来越清晰：
+
+**第一，Cosmos 3 的 MoT 架构为拆分提供了天然的"接缝"。** AR 和 DM 的边界在权重层面已经存在：共享 self-attention 但独立 FFN、单向交叉注意力但不对称信息流。拆分不是在强行切割——是在推理层面恢复训练时就存在的自然分工。
+
+**第二，FastWAM 已经证明了多频调度的可行性。** 他们在 Wan2.2 + T5 的基座上验证了"prefill video cache + action-only denoising"的推理模式。三频架构的本质是用 Cosmos 3 的 AR VLM 替换 T5，用 Cosmos 3 的 Generator 替换 Wan2.2 Video DiT——这个升级的方向是明确的，风险是可控的。
+
+**第三，AR VLM 闭环监督是这个架构的"灵魂"。** 如果只是实现了三频推理，那是 FastWAM 的简单变体。真正让这个方向独特的是认识到 AR VLM 本身就可以作为闭环的监督者——它能看到执行效果、能理解偏差、能自己决定什么时候介入。Gate 的外挂逻辑被 AR 本身的能力自然消解。
+
+**第四，RL 是自然的结果，不是额外的负担。** 不需要单独设计 reward function，不需要训练额外的 critic，不需要标注偏好数据。AR 的每一次评估、每一次纠正、每一次子目标推进——都是天然的 RL 训练信号。系统部署时间越长，积累的训练数据越多，模型越强，AR 干预越少——这是一个自加速的飞轮。
+
+**第五，最重要的是：这三个收益互相增强。** 多频推理 → 更快的交互 → 更多的 RL 数据 → 更好的模型 → 更少的 test-time 纠错 → 更快的推理。这不是三个独立的技术路线，而是一个统一的系统设计。一旦三频架构的工程基础建成，三个收益会自然协同涌现。
+
+**这个方向的本质，是把 Cosmos 3 从一个"大而全的统一模型"变成了一个"有层次的自适应系统"——不是靠增加参数和训练数据来提升能力，而是靠改变推理时的调度方式和闭环反馈来释放已有的潜能。**
+
+---
+
 
 ## 附录 A：Cosmos3-Nano 权重结构完整索引
 
