@@ -28,12 +28,14 @@ model = Cosmos3OmniForConditionalGeneration.from_pretrained(
 )
 ```
 
-| 风险点 | 严重度 | 分析 | 解决方案 |
-|--------|:-----:|------|---------|
-| `device_map="auto"` | ⚠️ 中 | HuggingFace Accelerate 的 `device_map` 通过 `torch.cuda.device_count()` 检测 GPU。Ascend NPU 上这个调用返回 0 | 使用 `device_map={"": "npu:0"}` 或 `max_memory` 手动指定，或直接 `.to("npu")` 然后手动管理显存 |
-| `torch.bfloat16` | ✅ 低 | torch_npu 2.7 支持 bf16。Ascend 910 原生支持 | 直接使用 |
-| `.from_pretrained()` | ✅ 低 | safetensors 加载是纯 CPU 操作，与设备无关 | 无 |
-| `Cosmos3OmniForConditionalGeneration` | ❌ 高 | 需要 transformers >= 5.11.0，当前 4.57.1 没有这个类 | **必须升级 transformers** |
+**`device_map="auto"`** ⚠️ 中 — Accelerate 通过 `torch.cuda.device_count()` 检测 GPU，NPU 上返回 0。
+→ 用 `device_map={"": "npu:0"}` 或直接 `.to("npu")` 手动管理显存。
+
+**`torch.bfloat16`** ✅ 低 — torch_npu 2.7 + Ascend 910 原生支持。
+
+**`.from_pretrained()`** ✅ 低 — safetensors 加载是纯 CPU 操作，与设备无关。
+
+**`Cosmos3OmniForConditionalGeneration`** ❌ 高 — 需要 transformers >= 5.11.0，当前 4.57.1 没有这个类。
 
 ### 1.2 Attention 机制
 
@@ -84,14 +86,15 @@ Cosmos 3 使用 **Wan2.2 VAE (AutoencoderKLWan)**，这是一个 3D VAE（包含
 
 ### 1.5 训练组件
 
-| 组件 | 严重度 | 分析 |
-|------|:-----:|------|
-| FSDP/HSDP (`torch.distributed.fsdp`) | ❌ 高 | FSDP 的 `ShardingStrategy`、`StateDictType`、`auto_wrap_policy` 等 API 在 HCCL backend 上的行为可能与 NCCL 不同。尤其 `SHARD_GRAD_OP` 和 `FULL_SHARD` 策略需要 HCCL all-gather/reduce-scatter 支持 |
-| Gradient Checkpointing (`torch.utils.checkpoint`) | ⚠️ 中 | 核心 `checkpoint` 函数是纯 PyTorch，但 re-computation 时的二阶梯度（如果 DiT 有需要）可能出错 |
-| AdamW Optimizer | ✅ 低 | 标准 PyTorch op, torch_npu 支持 |
-| Mixed Precision (bf16 AMP) | ⚠️ 中 | `torch.amp.autocast("npu")` API 不同，需要将 `"cuda"` 替换为 `"npu"` |
-| `torch.cuda.amp.GradScaler` | ✅ 低 | bf16 不需要 GradScaler（bf16 的动态范围足够） |
-| Distributed Process Group | ⚠️ 中 | `dist.init_process_group(backend="hccl")` 而非 `"nccl"`。Cosmos 3 使用 PyTorch FSDP，理论上 backend-agnostic |
+**FSDP/HSDP** ❌ 高 — `ShardingStrategy`、`auto_wrap_policy` 等在 HCCL backend 上行为可能与 NCCL 不同。DreamZero 已通过 monkey-patch `init_process_group` 解决此问题（见 §6）。
+
+**Gradient Checkpointing** ⚠️ 中 — 核心 `checkpoint` 是纯 PyTorch，但 re-computation 的二阶梯度可能出错。
+
+**AdamW Optimizer** ✅ 低 — 标准 PyTorch op，torch_npu 支持。
+
+**Mixed Precision (bf16 AMP)** ⚠️ 中 — 需将 `torch.cuda.amp.autocast()` 替换为 `torch.amp.autocast("npu")`。
+
+**bf16 GradScaler** ✅ 低 — bf16 动态范围足够，不需要。
 
 ### 1.6 推理优化组件
 
@@ -448,12 +451,13 @@ DreamZero 使用 PyTorch 原生的 `DeviceMesh` + FSDP，通过 monkey-patch 的
 
 ### ❌ 仍需解决
 
-| 问题 | 说明 |
-|------|------|
-| **Transformers/Diffusers 版本** | DreamZero 使用的是自己的 VLA 架构（`VLA` + `VLAConfig`），不依赖 HuggingFace Transformers 的 Cosmos 3 类。加载 Cosmos 3 checkpoint 仍然需要升级到 transformers >= 5.11.0。但 DreamZero 的 `VLA.from_pretrained` 提供了 safetensors 直接加载的模式，可以绕过 HF 类直接操作权重。 |
-| **Cosmos 3 的 add_* 交叉注意力** | DreamZero 使用的是标准 Wan2.2 的 cross-attention（对 text context）。Cosmos 3 特有的 `add_*` 交叉注意力（DM→AR 单向注入）是新的 attention 模式，需要移植到 NPU。但底层仍使用 SDPA，功能上可行。 |
-| **3D mRoPE** | DreamZero 的 Wan2.2 使用标准 1D RoPE。Cosmos 3 的 3D mRoPE（三组维度独立 position）需要验证 NPU 上复数运算（`torch.polar`, `view_as_complex`）的兼容性。 |
-| **Cosmos 3 Generator 推断（非训练）** | DreamZero 的 pipeline 是 backbone + action_head；Cosmos 3 的 Generator 推理（Diffusers `Cosmos3OmniPipeline`）流程不同。虽然不是训练问题，但 Phase 0 的验证需要加载完整的 Cosmos 3 Generator。 |
+1. **Transformers/Diffusers 版本** — 需升级到 >= 5.11.0 才能加载 Cosmos 3 checkpoint。DreamZero 的 `VLA.from_pretrained` 提供了 safetensors 直读模式，可绕过 HF 类直接操作权重。
+
+2. **Cosmos 3 `add_*` 交叉注意力** — DreamZero 使用的是标准 cross-attention（对 text）。Cosmos 3 的 `add_*`（DM→AR 单向注入）是新的 attention 模式，需移植到 NPU，但底层仍是 SDPA，功能上可行。
+
+3. **3D mRoPE** — DreamZero 使用标准 1D RoPE。Cosmos 3 的 3D mRoPE（三组维度独立 position）需验证 NPU 上 `torch.polar` / `view_as_complex` 兼容性。
+
+4. **Cosmos 3 Generator 推理 pipeline** — DreamZero 是 backbone + action_head 架构。Cosmos 3 的 Diffusers `Cosmos3OmniPipeline` 流程不同，Phase 0 验证需要直接加载完整 Generator。
 
 ### 对比总结
 
