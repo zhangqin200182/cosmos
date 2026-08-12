@@ -457,20 +457,21 @@ DreamZero 使用 PyTorch 原生的 `DeviceMesh` + FSDP，通过 monkey-patch 的
 
 ### 对比总结
 
-```
-原分析列出 30+ 风险点 → 经 DreamZero 代码审查:
+原分析列出 30+ 风险点，经 DreamZero 代码审查后的状态：
 
-  ✅ 已解决: ~70%  (设备抽象、分布式、Flash Attn、Wan DiT/VAE、FSDP)
-  ⚠️ 部分解决: ~15% (AMP 语法、device_map)
-  ❌ 仍需处理: ~15% (HF 版本、add_* 交叉注意、3D mRoPE、Generator pipeline)
+| 解决程度 | 占比 | 覆盖范围 |
+|:-------:|:---:|------|
+| ✅ 已解决 | ~70% | 设备抽象、分布式 backend、Flash Attn 回退、Wan DiT/VAE、FSDP |
+| ⚠️ 部分解决 | ~15% | AMP 语法、device_map |
+| ❌ 仍需处理 | ~15% | HF 版本升级、add_* 交叉注意力、3D mRoPE、Generator pipeline |
 
-关键发现:
-  1. DreamZero 的 device.py 是一个可以直接复用的设备抽象层
-  2. Monkey-patch init_process_group 消除了分布式训练的最大风险
-  3. SDPA fallback 策略和 Cosmos 3/FastWAM 的 attention 实现完全一致
-  4. Wan2.2 全家桶已在 NPU 验证 → Cosmos 3 Generator 的 DiT 和 VAE 部分可参考
-  5. 真正需要从零适配的是 Cosmos 3 特有的 add_* 交叉注意力和 3D mRoPE
-```
+**关键发现：**
+
+1. DreamZero 的 `device.py` 是一个可以直接复用的设备抽象层
+2. Monkey-patch `init_process_group` 消除了分布式训练的最大风险
+3. SDPA fallback 策略和 Cosmos 3/FastWAM 的 attention 实现完全一致
+4. Wan2.2 全家桶已在 NPU 验证 → Cosmos 3 Generator 的 DiT 和 VAE 部分可参考
+5. 真正需要从零适配的是 Cosmos 3 特有的 `add_*` 交叉注意力和 3D mRoPE
 
 ---
 
