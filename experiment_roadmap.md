@@ -20,38 +20,57 @@
 
 ## 二、构建与验证路径
 
-### Step 0：拆分 + 复原验证（Fidelity Check）
+### Step 0 A：一拆为二 + 复原验证（纯推理，零训练）
 
-**目标**：证明将 Cosmos 3 拆成三部分再连起来后，输出与拆分前完全一致。
+**目标**：将 Cosmos 3 拆为 AR + Generator 两部分，用 MoT mixed-attention 连回去，证明输出与拆分前一致。
+
+**要新建的模块：0 个。所有参数来自 Cosmos 3 checkpoint。**
 
 ```
 原始 Cosmos 3 (Policy 模式):
-  image + text → [统一 forward] → action + video
+  image + text → [AR ↔ Generator, 共享 self-attn + add_*] → action + video
 
-拆分后:
-  ① 提取 AR 塔 → prefill → AR K/V cache
-  ② 提取 Generator 塔 → 读取 AR K/V cache
-  ③ 实现 MoT mixed-attention 连接
-  ④ 联合 forward → action + video
+一拆为二:
+  ① 提取 AR 塔 → prefill → AR K/V cache (36层)
+  ② 提取 Generator 塔 → 读 AR K/V cache via MoT mixed-attention
+  ③ 联合 forward → action + video
 
-对比: 拆分前 output vs 拆分后 output
-  → 数值误差 < 1e-5 (bf16 精度范围内的浮点等价)
-  → 生成的动作序列和视频帧完全一致
+  对比: 拆分前 output == 拆分后 output ? (误差 < 1e-5)
 ```
 
 **要解决的问题**：
-1. 从 checkpoint 中识别并分离 AR 塔参数（哪些属于 AR，哪些属于 Generator，哪些共享）
-2. 实现 AR prefill + K/V 缓存
-3. 实现 MoT mixed-attention（替代原版 self-attention 中的 DM→AR 通路）
+1. 从 checkpoint 识别并分离 AR 参数和 Generator 参数
+2. 实现 AR prefill + 36 层 K/V 缓存
+3. 实现 MoT mixed-attention：Generator Q attend [AR_cached_K | Generator_K]
 4. 验证数值等价性
 
-**关键问题**：MoT mixed-attention 的连接方式会和原始 Cosmos 3 的 self-attention 有细微差异（原始是 Q/K/V 全部在同一次 softmax 中，拆分后是 Action Q attend cached AR K/V）。这两种计算路径是否数学等价？如果不完全等价（例如原始 attention 中有 DM→AR 的交互会影响 AR 的输出，但拆分后 AR 是 prefill 的，不受 DM 影响），差异有多大？
+**为什么应该等价**：Cosmos 3 中 AR tokens 被因果 mask 隔离，本来就看不到 DM tokens。AR 的 K/V 在原始和拆分两种情况下数学上应该完全一致。交叉注意力 `add_*` 是 DM→AR 单向，不改变 AR 的 K/V。**如果验证通过，就证明了拆分的正确性。**
 
-**实际上 Cosmos 3 的 AR tokens 本身就看不到 DM tokens**（因果 mask 阻止 + 交叉注意力单向）。所以 AR 的 K/V 在原始和拆分两种情况下**应该完全一致**——AR 的 forward 不依赖 DM tokens。如果验证通过，这就证明了拆分是 lossless 的。
+**如果失败**：说明我们对架构的理解有偏差（存在未分析到的 AR←DM 交互路径）。需要深入排查。
 
-**成功标准**：拆分前 vs 拆分后的 action 输出误差 < 1e-5（浮点等价）。
+---
 
-**如果失败**：说明 AR 和 DM 之间的交互比架构分析显示的更紧密（可能 DM tokens 通过某些未分析到的路径影响了 AR）。需要重新分析信息流。
+### Step 0 B：一拆为三（Generator → Video + Action）
+
+**目标**：在已验证正确的拆分架构上，将 Generator 进一步拆分为 Video DiT + Action DiT。
+
+```
+一拆为二（已验证 ✅）:
+  AR 塔 + Generator 塔
+
+一拆为三:
+  AR 塔 + Video 中频（已有）+ Action 高频（新建）
+  
+  Action DiT:
+    架构: 参考 FastWAM, hidden=1024, ffn=4096, 36 layers
+    参数: ~300M（新建，需训练）
+    训练: 冻结 AR + Video，仅训练 Action DiT + MoT 连接
+```
+
+**为什么分两步**：
+- 0A 是纯验证——不引入新模块，确认拆分逻辑本身正确
+- 0B 是建构——在已验证的基座上替换 Generator 的 action 部分
+- 如果 0A 失败，0B 不可能对
 
 ---
 
@@ -142,13 +161,23 @@ Step 0: 拆分证明 (Fidelity)
 ## 总结：构建顺序
 
 ```
-Step 0: 拆 Cosmos 3 → 连回去 → 证明输出不变（fidelity check）
-   ↓
-Step 1: 训练 Action DiT → 双频系统 → 验证 AR > T5 + 验证实时延迟
-   ↓
-Step 2: 加 Video 中频 → 三频系统 → 验证 Video 的 ablation 增益
-   ↓
-Step 3: 加 AR 闭环 + RL → 自我提升系统 → 验证 RL 样本效率
+Step 0A: 一拆为二（AR + Generator）
+  → 0 个新模块, 纯推理, 零训练
+  → 验证: 拆分后输出 == 原始 Cosmos 3 输出
+  → 成本: 1-2 天
+
+Step 0B: 一拆为三（AR + Video + Action）
+  → 1 个新模块（Action DiT, ~300M）
+  → 训练 Action DiT + MoT 连接
+  → 成本: 1-2 周
+
+Step 1: 实验验证
+  → 1.1: AR vs T5 条件信号对比
+  → 1.2: 延迟基准 (vs 原始 Cosmos 3, vs FastWAM)
+
+Step 2: + Video 中频 → ablation 增益
+
+Step 3: + AR 闭环 + RL → 样本效率
 
 每一步的输出是下一步的输入。
 每一步都有明确的成功标准和可对比的基线。
