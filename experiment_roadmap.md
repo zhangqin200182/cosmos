@@ -1,184 +1,194 @@
-# 三频架构：构建路径与实验验证（修订版）
-
-> **核心修正**：加入 Step 0——先证明拆分本身是 lossless 的，再在拆分后的架构上验证收益。
+# 三频架构：构建路径与实验验证
 
 ---
 
-## 一、最终架构
+## 整体路线
 
 ```
-模块 A: AR 低频推理器         ← Cosmos 3 checkpoint 拆分（已有）
-模块 B: Video 中频想象器      ← Cosmos 3 checkpoint 拆分（已有，可选）
-模块 C: Action 高频执行器     ← 新建（需训练）
-
-连接机制: MoT Mixed-Attention ← 新建（需实现）
-
-最终系统 = A + B + C + MoT 连接
+Phase 1: Cosmos 3 复现 → 跑通原始模型推理
+    ↓
+Phase 2: 一拆为二 → 验证拆分后仍能 work
+    ↓
+Phase 3: 一拆为二的收益验证 → AR/DiT 不同频率 + AR 观测反馈
+    ↓          （不引入任何新模块，纯用已有权重）
+    ↓
+Phase 4: 一拆为三 → 训练 Action DiT → 完整收益验证
 ```
 
 ---
 
-## 二、构建与验证路径
+## Phase 1：Cosmos 3 复现
 
-### Step 0 A：一拆为二 + 复原验证（纯推理，零训练）
+**目标**：在 NPU 上跑通 Cosmos 3 原始推理，建立基线。
 
-**目标**：将 Cosmos 3 拆为 AR + Generator 两部分，用 MoT mixed-attention 连回去，证明输出与拆分前一致。
+**要做的**：
+- 加载 Cosmos3-Nano checkpoint
+- 跑通 Reasoner 模式（text/image → text）
+- 跑通 Generator Policy 模式（image + text → action + video）
+- 记录基线指标：推理延迟、显存占用、输出质量
 
-**要新建的模块：0 个。所有参数来自 Cosmos 3 checkpoint。**
+**产出**：NPU 上的 Cosmos 3 推理基线。后续所有"拆分后 vs 拆分前"的对比，都以这个基线的输出为准。
+
+---
+
+## Phase 2：一拆为二（AR + Generator）
+
+**目标**：将 Cosmos 3 拆成 AR 塔和 Generator 塔，用 MoT mixed-attention 连回去，验证输出与拆分前一致。
+
+**一拆为二是什么**：
 
 ```
-原始 Cosmos 3 (Policy 模式):
-  image + text → [AR ↔ Generator, 共享 self-attn + add_*] → action + video
+原始 Cosmos 3:
+  [AR 塔] ←→ [Generator 塔]
+  共享 self-attn Q/K/V + add_* 交叉注意力
 
-一拆为二:
-  ① 提取 AR 塔 → prefill → AR K/V cache (36层)
-  ② 提取 Generator 塔 → 读 AR K/V cache via MoT mixed-attention
-  ③ 联合 forward → action + video
+拆分后:
+  ┌──────────┐         ┌───────────────────┐
+  │  AR 塔    │         │  Generator 塔      │
+  │ (Reasoner)│         │ (Video + Action)  │
+  │           │ AR K/V  │                   │
+  │ prefill → │────────→│ 读 AR K/V cache   │
+  │ K/V cache │         │ (MoT连接)          │
+  └──────────┘         └───────────────────┘
 
-  对比: 拆分前 output == 拆分后 output ? (误差 < 1e-5)
+  0 个新模块。
+  所有参数来自 Cosmos 3 checkpoint。
+  只需实现 AR prefill + K/V cache + MoT mixed-attention 连接。
 ```
 
 **要解决的问题**：
 1. 从 checkpoint 识别并分离 AR 参数和 Generator 参数
-2. 实现 AR prefill + 36 层 K/V 缓存
+2. 实现 AR prefill → 36 层 K/V 缓存
 3. 实现 MoT mixed-attention：Generator Q attend [AR_cached_K | Generator_K]
-4. 验证数值等价性
+4. 验证数值等价性：拆分后输出 == 原始 Cosmos 3 输出（误差 < 1e-5）
 
-**为什么应该等价**：Cosmos 3 中 AR tokens 被因果 mask 隔离，本来就看不到 DM tokens。AR 的 K/V 在原始和拆分两种情况下数学上应该完全一致。交叉注意力 `add_*` 是 DM→AR 单向，不改变 AR 的 K/V。**如果验证通过，就证明了拆分的正确性。**
-
-**如果失败**：说明我们对架构的理解有偏差（存在未分析到的 AR←DM 交互路径）。需要深入排查。
+**为什么应该等价**：AR tokens 被因果 mask 隔离，本来就看不到 DM tokens。AR 的 K/V 在拆分前后数学上完全一致。
 
 ---
 
-### Step 0 B：一拆为三（Generator → Video + Action）
+## Phase 3：一拆为二的收益验证
 
-**目标**：在已验证正确的拆分架构上，将 Generator 进一步拆分为 Video DiT + Action DiT。
+**关键洞察**：一拆为二后，AR 和 Generator 已经是两个独立运行的模块，收益自然显现——不需要等到一拆为三。
+
+### 收益 3.1：多频推理（不同执行频率）
 
 ```
-一拆为二（已验证 ✅）:
-  AR 塔 + Generator 塔
+原始 Cosmos 3:
+  每步去噪都跑 AR FFN + Generator FFN → AR FFN 50 次重复计算
+
+一拆为二后:
+  AR prefill 一次 (缓存 K/V) → Generator 去噪 N 步，每次只跑 Generator FFN
+  → AR 的计算开销从 N 次降到 1 次
+  → Generator 的每步去噪更快（不再夹杂 AR FFN）
+```
+
+**实验**：对比拆分前后的 Policy 推理延迟。
+
+| 配置 | 每步计算 | N=50 总延迟 | N=4 总延迟 |
+|------|---------|:---:|:---:|
+| 原始 Cosmos 3 | AR FFN + Gen FFN | T_original × 50 | T_original × 4 |
+| 一拆为二 | Gen FFN only (AR cached) | T_split × 50 | T_split × 4 |
+
+**预期**：T_split < T_original（Gen FFN 不再被 AR FFN 的计算和同步拖累）。即使不去蒸馏，拆分本身就有加速。
+
+### 收益 3.2：AR 观测与反馈（低频 AR 监督中频 DiT）
+
+```
+AR 不需要每步都运行。它可以"偶尔看一眼"Generator 的输出：
+
+  循环中:
+    Generator 生成 action + video rollout（中频, ~3 Hz）
+    AR 每 N 步醒来一次（低频, ~1 Hz）:
+      → 看 Generator 生成的 video rollout
+      → 判断: 轨迹是否合理？目标是否在接近？
+      → 如果不合理 → 更新文本条件 → 指导 Generator 调整
+      → 如果子目标完成 → 推进到下一阶段
+```
+
+**实验**：在一个闭环任务上（如 LIBERO simulation），对比：
+
+| 条件 | AR 频率 | 描述 |
+|------|:---:|------|
+| Baseline | 每步 | 原始 Cosmos 3 Policy（AR 每步都跑） |
+| 多频-稀疏 | 每 10 步 | AR 每 10 步看一眼，其余步只用缓存条件 |
+| 多频-自适应 | 动态 | AR 自己决定什么时候看（基于上次评估的置信度） |
+
+**对比指标**：
+- 任务成功率（多频不应该明显低于每步 AR）
+- AR 总计算量（多频应远低于每步 AR）
+- AR 成功发现并纠正偏差的次数
+
+**核心问题**：AR 低频运行会不会导致任务成功率下降？在什么频率下能兼顾效率和效果？
+
+---
+
+## Phase 4：一拆为三 + 收益验证
+
+**目标**：将 Generator 进一步拆为 Video 中频 + Action 高频，训练轻量 Action DiT。
+
+```
+一拆为二:
+  AR 塔 + Generator 塔 (Video + Action 在一起)
 
 一拆为三:
-  AR 塔 + Video 中频（已有）+ Action 高频（新建）
-  
-  Action DiT:
-    架构: 参考 FastWAM, hidden=1024, ffn=4096, 36 layers
-    参数: ~300M（新建，需训练）
-    训练: 冻结 AR + Video，仅训练 Action DiT + MoT 连接
+  AR 塔 + Video 中频 (已有) + Action 高频 (新建, ~300M, 需训练)
 ```
 
-**为什么分两步**：
-- 0A 是纯验证——不引入新模块，确认拆分逻辑本身正确
-- 0B 是建构——在已验证的基座上替换 Generator 的 action 部分
-- 如果 0A 失败，0B 不可能对
+### 构建
+
+- 从 Generator 塔中分离 Video 能力（保留）
+- 构建轻量 Action DiT（参考 FastWAM, hidden=1024, ffn=4096）
+- 训练：冻结 AR + Video，只训练 Action DiT + MoT 连接
+
+### 收益验证
+
+| 实验 | 对比 | 要证明什么 |
+|------|------|-----------|
+| 4.1: AR vs T5 | 三频架构 vs FastWAM（相同 ActionDiT，不同条件编码器） | AR 的条件信号优于 T5 |
+| 4.2: 延迟基准 | 三频 Action-only vs 一拆为二的 Generator | Action 高频推理的延迟优势 |
+| 4.3: Video 增益 | 有无 Video 中频的 ablation | Video 物理验证的价值 |
+| 4.4: RL 样本效率 | RL vs BC 微调 | AR 监督信号使系统自我提升 |
 
 ---
 
-### Step 1：双频训练（AR + Action）
-
-**目标**：在已验证 lossless 的拆分架构上，训练 Action DiT，实现双频推理。
+## 各阶段的模块变化
 
 ```
-基于 Step 0 验证的拆分方式:
-  ① AR 塔: 冻结 → prefill K/V cache
-  ② Action DiT: 新建 + 训练 ← 读取 AR K/V cache
-  ③ MoT mixed-attention: 同 Step 0 的实现
+Phase 1:  原始 Cosmos 3 推理
+          无拆分，无新模块
 
-训练: 冻结 AR + MoT 连接权重，只训练 Action DiT
-```
+Phase 2:  一拆为二
+          AR 塔 (已有) + Generator 塔 (已有)
+          新建: MoT 连接 (~200 行 Python)
+          新训练: 0
 
-**为什么 Step 0 必须先做**：
-- Step 0 验证了 AR K/V cache + MoT 连接的正确性
-- Step 1 只是把 Generator 塔替换为 Action DiT，AR 侧完全不动
-- 如果 Step 0 验证通过，Step 1 的 AR 侧推理正确性就有了保证
+Phase 3:  一拆为二 + 多频调度
+          同 Phase 2 的模块，加上:
+          新建: AR 周期性唤醒逻辑 (~100 行 Python)
+          新训练: 0
 
----
-
-### 实验 1.1：AR vs T5（双频 vs FastWAM）
-
-**控制变量**：相同的 Action DiT 架构和训练数据，唯一不同是条件编码器。
-
-| 条件 | Variant A (FastWAM) | Variant B (我们的双频) |
-|------|:---:|:---:|
-| 文本编码器 | T5 | Cosmos 3 AR 塔 |
-| Action DiT | FastWAM ActionDiT | 我们的 ActionDiT |
-| 训练数据 | LIBERO-10 | 同 A |
-| 训练量 | 同 A | 同 A |
-
-**对比指标**：Action MSE、任务成功率、未见指令泛化率。
-
-**核心问题**：AR 的语义理解和物理推理能力，是否转化为更好的 Action 条件信号？
-
----
-
-### 实验 1.2：延迟对比
-
-| 配置 | 预期延迟 / Action Chunk | 等效频率 |
-|------|:---:|:---:|
-| Cosmos 3 原始 Policy (16B, 50步) | ~10-30s | < 1 Hz |
-| **我们的双频 (AR prefill + Action, N步)** | **< 200ms** | **> 30 Hz** |
-
----
-
-### Step 2：加入 Video 中频（可选）
-
-**目标**：在双频基础上加入 Video 层，做 physical plausibility gate。
-
-**实验 2.1**：有无 Video 中频的 ablation。在需要物理推理的复杂任务上对比双频和三频的成功率和 AR 触发频率。
-
----
-
-### Step 3：AR 闭环 + RL
-
-**目标**：AR 定期观察执行效果 → 判断偏差 → 积累训练数据 → RL 自我提升。
-
-**实验 3.1**：AR 偏差检测精度。**实验 3.2**：RL vs BC 样本效率。
-
----
-
-## 三、Paper 叙事线
-
-```
-Step 0: 拆分证明 (Fidelity)
-  → "Cosmos 3 的 AR 和 DM 在推理时可以被无损分离"
-  → 建立三频架构的正确性基础
-
-实验 1.1: AR 条件信号 > T5
-  → "AR 的语义理解优势转化为更好的 Action 生成"
-
-实验 1.2: 延迟基准
-  → "多频推理实现实时控制"
-
-实验 2.1: Video 增益
-  → "中频物理验证在复杂任务上的价值"
-
-实验 3.1+3.2: 闭环 + RL
-  → "AR 自然语言监督使系统自我提升"
+Phase 4:  一拆为三
+          AR 塔 (已有) + Video 中频 (已有) + Action 高频 (新建, ~300M)
+          新建: Action DiT 网络 + 训练管线
+          新训练: Action DiT (LIBERO/DROID, 数万条数据)
 ```
 
 ---
 
-## 总结：构建顺序
+## 收益的逐步呈现
 
 ```
-Step 0A: 一拆为二（AR + Generator）
-  → 0 个新模块, 纯推理, 零训练
-  → 验证: 拆分后输出 == 原始 Cosmos 3 输出
-  → 成本: 1-2 天
+Phase 2 完成时:
+  ✓ 拆分本身被验证为 lossless
 
-Step 0B: 一拆为三（AR + Video + Action）
-  → 1 个新模块（Action DiT, ~300M）
-  → 训练 Action DiT + MoT 连接
-  → 成本: 1-2 周
+Phase 3 完成时（一拆为二 + 多频调度）:
+  ✓ 收益 A: 推理加速（AR 从 N 次降到 1 次）
+  ✓ 收益 B: AR 低频观测 + 反馈（test-time scaling 的雏形）
+  → 此时已有可发表的阶段性结果
 
-Step 1: 实验验证
-  → 1.1: AR vs T5 条件信号对比
-  → 1.2: 延迟基准 (vs 原始 Cosmos 3, vs FastWAM)
-
-Step 2: + Video 中频 → ablation 增益
-
-Step 3: + AR 闭环 + RL → 样本效率
-
-每一步的输出是下一步的输入。
-每一步都有明确的成功标准和可对比的基线。
+Phase 4 完成时（一拆为三）:
+  ✓ 收益 C: Action 高频 → 实时控制延迟
+  ✓ 收益 D: AR 条件信号 > T5
+  ✓ 收益 E: Video 中频物理验证
+  ✓ 收益 F: RL 自我提升
 ```
