@@ -2,23 +2,41 @@
 
 > 环境: PyTorch 2.7.1 + torch_npu, 16 × Ascend 910 (64 GiB HBM), HCCL backend
 > 基线: DreamZero 已在同环境跑通 Wan2.2 训练/推理，提供了完整 NPU 设备抽象层
+> **更新 (2026-08-12):** Transformers 5.11.0 + huggingface_hub 1.27.0 已安装，Cosmos3OmniForConditionalGeneration 导入成功
 > 目标: 识别剩余 CUDA→NPU 迁移障碍，评估可行性和工作量
 
 ---
 
-## 总览（更新：经 DreamZero 代码审查后）
+## 总览（最终版）
 
-| 组件 | 原始风险 | 当前风险 | 说明 |
+| 组件 | 原始风险 | 最终风险 | 说明 |
 |------|:---:|:---:|------|
-| Cosmos 3 - AR 推理 | ⚠️ 中 | ✅ 低 | DreamZero 设备抽象层 + SDPA 已验证 |
-| Cosmos 3 - Generator 推理 | ⚠️ 中-高 | ⚠️ 低-中 | add_* 交叉注意 + 3D mRoPE + VAE 需移植 |
-| Cosmos 3 - SFT 训练 | ❌ 高 | ⚠️ 中 | FSDP 已由 monkey-patch nccl→hccl 解决 |
-| FastWAM - 推理 | ⚠️ 中 | ✅ 低 | SDPA + Wan VAE 已在 DreamZero 验证 |
-| FastWAM - 训练 | ❌ 高 | ⚠️ 中 | DeepSpeed 可通过 monkey-patch 绕过 |
+| Cosmos 3 - AR 推理 | ⚠️ 中 | ✅ 极低 | 依赖已就绪，SDPA 已验证，AR forward 纯标准 op |
+| Cosmos 3 - Generator 推理 | ⚠️ 中-高 | ⚠️ 低 | add_* 交叉注意 + 3D mRoPE 需移植，底层均为标准 op |
+| Cosmos 3 - SFT 训练 | ❌ 高 | ⚠️ 中 | FSDP monkey-patch 已验证，需验证 Cosmos 3 特定 FSDP 配置 |
+| FastWAM - 推理 | ⚠️ 中 | ✅ 极低 | SDPA + Wan VAE 已在 DreamZero 生产验证 |
+| FastWAM - 训练 | ❌ 高 | ⚠️ 中 | DeepSpeed 可通过 monkey-patch 绕过，单 NPU DDP 更简单 |
 
-### 剩余硬障碍
+### 现状：硬障碍已全部消除
 
-**只有 1 个**：Transformers/Diffusers 版本升级。当前 4.57.1/0.30.2，需要 >= 5.11.0 / latest main 才能加载 Cosmos 3 checkpoint。
+~~Transformers/Diffusers 版本升级~~ **✅ 已解决 (2026-08-12)**
+
+| 包 | 升级前 | 升级后 | 状态 |
+|---|--------|--------|:---:|
+| `transformers` | 4.57.1 | **5.11.0** | ✅ |
+| `huggingface_hub` | 0.36.2 | **1.27.0** | ✅ |
+| `diffusers` | 0.30.2 | **不变** | ✅ Phase 0 不需要 Generator pipeline |
+| 其他（torch, tokenizers, safetensors, accelerate） | — | **不变** | ✅ 均在兼容范围内 |
+
+### 剩余工作：仅 Cosmos 3 特有组件的移植验证（0 个硬障碍）
+
+| 工作 | 风险 | 说明 |
+|------|:---:|------|
+| NPU 上加载 Cosmos3-Nano checkpoint | ✅ 极低 | safetensors 纯 CPU 操作，DreamZero 已验证同类加载 |
+| AR 塔 forward (SDPA + Linear + mRoPE) | ✅ 极低 | 均为 torch_npu 已实现的标准 op |
+| `add_*` 交叉注意力移植 | ⚠️ 低 | 底层 SDPA + Linear，无 CUDA kernel |
+| 3D mRoPE 验证 | ⚠️ 低 | 复数运算 NPU 支持，仅 prefill 一次 |
+| Generator 推理 (可选，Phase 1+) | ⚠️ 低 | VAE 已被 DreamZero 验证，需适配 Diffusers pipeline |
 
 ### DreamZero 已消除的主要风险
 
