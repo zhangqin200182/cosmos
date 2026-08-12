@@ -1,221 +1,155 @@
-# 三频架构：构建路径与实验验证
+# 三频架构：构建路径与实验验证（修订版）
+
+> **核心修正**：加入 Step 0——先证明拆分本身是 lossless 的，再在拆分后的架构上验证收益。
 
 ---
 
-## 一、最终架构：三个模块 + 一个连接机制
+## 一、最终架构
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        最终三频系统                               │
-│                                                                 │
-│  模块 A: AR 低频推理器                                           │
-│  ┌────────────────────────────────────────────┐                 │
-│  │ 来源: Cosmos 3 checkpoint 拆分              │                 │
-│  │ 组件: self_attn Q/K/V/O, mlp, vision_enc,  │                 │
-│  │       embed_tokens, lm_head                │                 │
-│  │ 职责: 看图像 → 理解场景 → 规划子任务        │                 │
-│  │       → 判断偏差 → 唤醒自己                  │                 │
-│  │ 频率: ~1 Hz (prefill 一次, K/V 缓存)        │                 │
-│  └────────────────────┬───────────────────────┘                 │
-│                       │ AR K/V cache                            │
-│                       ▼                                         │
-│  模块 B: Video 中频想象器 (可选)                                  │
-│  ┌────────────────────────────────────────────┐                 │
-│  │ 来源: Cosmos 3 checkpoint 拆分              │                 │
-│  │ 组件: mlp_moe_gen, add_*, proj_in/out,     │                 │
-│  │       VAE, time_embedder                    │                 │
-│  │ 职责: 生成未来 rollout → 验证物理合理性      │                 │
-│  │ 频率: ~3 Hz (按需触发, K/V 缓存)             │                 │
-│  └────────────────────┬───────────────────────┘                 │
-│                       │ Video K/V cache                         │
-│                       ▼                                         │
-│  模块 C: Action 高频执行器                                       │
-│  ┌────────────────────────────────────────────┐                 │
-│  │ 来源: 新建, 需训练                           │                 │
-│  │ 组件: 独立 self_attn Q/K/V/O, 轻量 FFN      │                 │
-│  │ 大小: ~300M params (hidden=1024, 36 layers) │                 │
-│  │ 职责: 接收条件 → 去噪 → 输出 action chunk    │                 │
-│  │ 频率: ~30 Hz (等效)                          │                 │
-│  └────────────────────────────────────────────┘                 │
-│                                                                 │
-│  连接机制: MoT Mixed-Attention                                   │
-│  ┌────────────────────────────────────────────┐                 │
-│  │ 每层: Action Q attend [AR K/V | Video K/V] │                 │
-│  │ AR/Video 已缓存, 不重算                     │                 │
-│  │ Action 有自己的 post-attention FFN          │                 │
-│  └────────────────────────────────────────────┘                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+模块 A: AR 低频推理器         ← Cosmos 3 checkpoint 拆分（已有）
+模块 B: Video 中频想象器      ← Cosmos 3 checkpoint 拆分（已有，可选）
+模块 C: Action 高频执行器     ← 新建（需训练）
 
-**最终系统 = 模块 A（已有）+ 模块 B（已有，可选）+ 模块 C（新建）+ MoT 连接（新建）**
+连接机制: MoT Mixed-Attention ← 新建（需实现）
 
----
-
-## 二、构建路径：三步搭出完整系统
-
-### 第一步：搭建双频最小系统（AR + Action）
-
-目标产物：能用 AR 做条件，跑 Action 推理。
-
-```
-┌─────────────────────┐     ┌──────────────────────┐
-│ 模块 A: AR 推理器    │     │ 模块 C: Action 执行器  │
-│ (Cosmos 3 拆分)      │────→│ (新建, 需训练)         │
-│ 已有 ✅              │     │ 待构建 ⚠️               │
-└─────────────────────┘     └──────────────────────┘
-         │                           │
-         └─── MoT Mixed-Attention ───┘
-              (新建, 需实现)
-
-要解决的问题:
-  ① 从 Cosmos 3 checkpoint 中提取 AR 塔权重
-     → 保留哪些参数? 怎么保存和加载?
-  ② 实现 MoT Mixed-Attention 层
-     → 每层怎么 concat K/V? mask 怎么设?
-  ③ 构建 Action DiT 网络
-     → 架构设计 (参考 FastWAM ActionDiT)
-  ④ 训练 Action DiT
-     → 数据 (LIBERO/DROID), 损失 (flow matching MSE)
-     → 冻结 AR, 只训练 Action DiT + MoT 连接
-```
-
-### 第二步：加入 Video 中频（可选）
-
-目标产物：AR + Video + Action 全三频。
-
-```
-┌──────────┐    ┌──────────────┐    ┌──────────┐
-│ 模块 A    │    │ 模块 B: Video │    │ 模块 C    │
-│ AR 推理   │───→│ 想象+验证     │───→│ Action    │
-│ 已有 ✅   │    │ (拆分, 已有)   │    │ 已有 ✅   │
-└──────────┘    └──────────────┘    └──────────┘
-
-要解决的问题:
-  ⑤ 从 Cosmos 3 checkpoint 中提取 Video 塔权重
-  ⑥ 实现 Video rollout 推理 (仅需 ~20 步去噪, latent 空间即可)
-  ⑦ Video K/V cache → Action MoT 连接
-```
-
-### 第三步：加入 AR 闭环监督 + RL
-
-目标产物：自我提升的三频系统。
-
-```
-┌──────────────────────────────────────────────────┐
-│ AR 不仅产出子任务规划, 还在执行中定期醒来:          │
-│   看图像 → 评估执行效果 → 决定继续/调整/重规划      │
-│                                                  │
-│ AR 的每次评估 = 训练数据:                          │
-│   "这一步做对了" → 正样本                          │
-│   "这一步错了, 应该这样做" → hindsight relabeling   │
-│                                                  │
-│ Action DiT 用这些数据做 RL 微调                     │
-└──────────────────────────────────────────────────┘
-
-要解决的问题:
-  ⑧ 实现 AR 结构化输出 (子目标 + 偏差评估 + 唤醒时机)
-  ⑨ 实现 AR critique → 训练数据管线
-  ⑩ RL 微调 Action DiT
+最终系统 = A + B + C + MoT 连接
 ```
 
 ---
 
-## 三、实验设计：每步搭完后的收益验证
+## 二、构建与验证路径
 
-### 第一步验证（AR + Action 双频 vs FastWAM 双频）
+### Step 0：拆分 + 复原验证（Fidelity Check）
 
-**实验 1.1：AR vs T5 条件信号对比**
+**目标**：证明将 Cosmos 3 拆成三部分再连起来后，输出与拆分前完全一致。
 
-我们现在有什么：AR 塔 + Action DiT。
-FastWAM 有什么：T5 文本编码器 + Action DiT。
+```
+原始 Cosmos 3 (Policy 模式):
+  image + text → [统一 forward] → action + video
 
-| 条件 | Variant A (基线) | Variant B (我们的) |
+拆分后:
+  ① 提取 AR 塔 → prefill → AR K/V cache
+  ② 提取 Generator 塔 → 读取 AR K/V cache
+  ③ 实现 MoT mixed-attention 连接
+  ④ 联合 forward → action + video
+
+对比: 拆分前 output vs 拆分后 output
+  → 数值误差 < 1e-5 (bf16 精度范围内的浮点等价)
+  → 生成的动作序列和视频帧完全一致
+```
+
+**要解决的问题**：
+1. 从 checkpoint 中识别并分离 AR 塔参数（哪些属于 AR，哪些属于 Generator，哪些共享）
+2. 实现 AR prefill + K/V 缓存
+3. 实现 MoT mixed-attention（替代原版 self-attention 中的 DM→AR 通路）
+4. 验证数值等价性
+
+**关键问题**：MoT mixed-attention 的连接方式会和原始 Cosmos 3 的 self-attention 有细微差异（原始是 Q/K/V 全部在同一次 softmax 中，拆分后是 Action Q attend cached AR K/V）。这两种计算路径是否数学等价？如果不完全等价（例如原始 attention 中有 DM→AR 的交互会影响 AR 的输出，但拆分后 AR 是 prefill 的，不受 DM 影响），差异有多大？
+
+**实际上 Cosmos 3 的 AR tokens 本身就看不到 DM tokens**（因果 mask 阻止 + 交叉注意力单向）。所以 AR 的 K/V 在原始和拆分两种情况下**应该完全一致**——AR 的 forward 不依赖 DM tokens。如果验证通过，这就证明了拆分是 lossless 的。
+
+**成功标准**：拆分前 vs 拆分后的 action 输出误差 < 1e-5（浮点等价）。
+
+**如果失败**：说明 AR 和 DM 之间的交互比架构分析显示的更紧密（可能 DM tokens 通过某些未分析到的路径影响了 AR）。需要重新分析信息流。
+
+---
+
+### Step 1：双频训练（AR + Action）
+
+**目标**：在已验证 lossless 的拆分架构上，训练 Action DiT，实现双频推理。
+
+```
+基于 Step 0 验证的拆分方式:
+  ① AR 塔: 冻结 → prefill K/V cache
+  ② Action DiT: 新建 + 训练 ← 读取 AR K/V cache
+  ③ MoT mixed-attention: 同 Step 0 的实现
+
+训练: 冻结 AR + MoT 连接权重，只训练 Action DiT
+```
+
+**为什么 Step 0 必须先做**：
+- Step 0 验证了 AR K/V cache + MoT 连接的正确性
+- Step 1 只是把 Generator 塔替换为 Action DiT，AR 侧完全不动
+- 如果 Step 0 验证通过，Step 1 的 AR 侧推理正确性就有了保证
+
+---
+
+### 实验 1.1：AR vs T5（双频 vs FastWAM）
+
+**控制变量**：相同的 Action DiT 架构和训练数据，唯一不同是条件编码器。
+
+| 条件 | Variant A (FastWAM) | Variant B (我们的双频) |
 |------|:---:|:---:|
-| 文本编码器 | T5 (FastWAM) | Cosmos 3 AR 塔 |
+| 文本编码器 | T5 | Cosmos 3 AR 塔 |
 | Action DiT | FastWAM ActionDiT | 我们的 ActionDiT |
 | 训练数据 | LIBERO-10 | 同 A |
 | 训练量 | 同 A | 同 A |
-| MoT 连接 | FastWAM 原生 | 我们的实现 |
 
-**唯一变量：文本编码器是 T5 还是 AR。**
+**对比指标**：Action MSE、任务成功率、未见指令泛化率。
 
-对比指标：
-- Action MSE（预测 vs ground truth）
-- 任务成功率（simulation）
-- **未见指令泛化率**（最关键——这才能体现 AR 的物理推理和语义理解优势）
-
-**这个实验回答：我们的双频系统比 FastWAM 的双频系统好吗？好在哪里？**
+**核心问题**：AR 的语义理解和物理推理能力，是否转化为更好的 Action 条件信号？
 
 ---
 
-**实验 1.2：延迟基准对比**
+### 实验 1.2：延迟对比
 
-| 配置 | 每次 Action chunk 推理延迟 | 等效控制频率 |
+| 配置 | 预期延迟 / Action Chunk | 等效频率 |
 |------|:---:|:---:|
 | Cosmos 3 原始 Policy (16B, 50步) | ~10-30s | < 1 Hz |
-| Cosmos 3 原始 Policy (蒸馏 4步) | ~1-3s | ~1-10 Hz |
-| FastWAM infer_action | ~0.5-1s | ~10-30 Hz |
-| **我们的双频 (AR prefill + Action)** | **目标 < 200ms** | **> 30 Hz** |
-
-**这个实验回答：我们能实时跑吗？比现有方案快多少？**
+| **我们的双频 (AR prefill + Action, N步)** | **< 200ms** | **> 30 Hz** |
 
 ---
 
-### 第二步验证（加入 Video 中频后的增益）
+### Step 2：加入 Video 中频（可选）
 
-**实验 2.1：有无 Video 中频的 ablation**
+**目标**：在双频基础上加入 Video 层，做 physical plausibility gate。
 
-| 条件 | Variant A（双频） | Variant B（三频） |
-|------|:---:|:---:|
-| AR 条件 | ✅ | ✅ |
-| Action DiT | ✅ | ✅ |
-| Video 中频 | ❌ | ✅ |
-
-在复杂任务上对比（需要物理推理的任务，如"把杯子倒过来放"）：
-- 首次成功率（Video rollout 能提前发现不可行的计划）
-- AR 被触发的频率（有 Video 物理门控时，AR 不需要频繁检查）
-
-**这个实验回答：Video 中频到底有没有用？在什么任务上有用？**
+**实验 2.1**：有无 Video 中频的 ablation。在需要物理推理的复杂任务上对比双频和三频的成功率和 AR 触发频率。
 
 ---
 
-### 第三步验证（AR 闭环 + RL 的增益）
+### Step 3：AR 闭环 + RL
 
-**实验 3.1：AR 偏差检测精度**
+**目标**：AR 定期观察执行效果 → 判断偏差 → 积累训练数据 → RL 自我提升。
 
-用注入已知误差的轨迹（gripper 偏移、物体滑落、轨迹偏离），测试 AR 能否正确：
-- 检测"有问题"
-- 分类"什么类型的问题"
-- 判断"需不需要重规划"
-
-**这个实验回答：AR 能不能当好"监督者"？**
+**实验 3.1**：AR 偏差检测精度。**实验 3.2**：RL vs BC 样本效率。
 
 ---
 
-**实验 3.2：RL 样本效率对比**
-
-| 条件 | Baseline (BC) | RL (AR 引导) |
-|------|:---:|:---:|
-| 训练方式 | 纯 Behavior Cloning | AR critique + hindsight relabeling |
-| 数据量 | N 条轨迹 | N 条轨迹（相同） |
-| 评估 | 成功率 | 成功率 |
-
-**这个实验回答：AR 的评估信号能不能让模型用更少数据达到更高成功率？**
-
----
-
-## 四、总结：构建顺序 vs 验证时机
+## 三、Paper 叙事线
 
 ```
-构建步骤                  搭完后验证什么                关键结果
-──────────────────────────────────────────────────────────────────
-第1步: AR + Action 双频    实验1.1: AR vs T5 条件对比    "三频的AR条件比FastWAM好"
-                          实验1.2: 延迟基准             "能实时跑, 比原版快100x"
+Step 0: 拆分证明 (Fidelity)
+  → "Cosmos 3 的 AR 和 DM 在推理时可以被无损分离"
+  → 建立三频架构的正确性基础
 
-第2步: + Video 中频       实验2.1: 有无Video的ablation  "Video在复杂任务上有增益"
+实验 1.1: AR 条件信号 > T5
+  → "AR 的语义理解优势转化为更好的 Action 生成"
 
-第3步: + AR闭环 + RL     实验3.1: AR偏差检测精度        "AR能当好监督者"
-                          实验3.2: RL样本效率           "RL让系统自我提升"
+实验 1.2: 延迟基准
+  → "多频推理实现实时控制"
+
+实验 2.1: Video 增益
+  → "中频物理验证在复杂任务上的价值"
+
+实验 3.1+3.2: 闭环 + RL
+  → "AR 自然语言监督使系统自我提升"
 ```
 
-**每一步搭完一个可运行的系统，产出可对比的实验结果。不是先搭完三频再做实验。**
+---
+
+## 总结：构建顺序
+
+```
+Step 0: 拆 Cosmos 3 → 连回去 → 证明输出不变（fidelity check）
+   ↓
+Step 1: 训练 Action DiT → 双频系统 → 验证 AR > T5 + 验证实时延迟
+   ↓
+Step 2: 加 Video 中频 → 三频系统 → 验证 Video 的 ablation 增益
+   ↓
+Step 3: 加 AR 闭环 + RL → 自我提升系统 → 验证 RL 样本效率
+
+每一步的输出是下一步的输入。
+每一步都有明确的成功标准和可对比的基线。
+```
